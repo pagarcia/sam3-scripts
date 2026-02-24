@@ -10,6 +10,7 @@ from typing import Optional, Tuple, List
 
 import numpy as np
 import cv2
+from PIL import Image
 import torch
 
 
@@ -59,7 +60,10 @@ def pick_image_file() -> Optional[str]:
 def compute_display_base(img_bgr: np.ndarray, max_side: int = 1200) -> Tuple[np.ndarray, float]:
     h, w = img_bgr.shape[:2]
     scale = min(1.0, float(max_side) / float(max(h, w)))
-    disp = cv2.resize(img_bgr, (int(w * scale), int(h * scale))) if scale < 1.0 else img_bgr.copy()
+    if scale < 1.0:
+        disp = cv2.resize(img_bgr, (int(w * scale), int(h * scale)))
+    else:
+        disp = img_bgr.copy()
     return disp, scale
 
 
@@ -71,56 +75,56 @@ def green_overlay(bgr: np.ndarray, mask_bool: np.ndarray, alpha: float = 0.5) ->
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser("SAM3 interactive image demo (points)")
+    ap = argparse.ArgumentParser("SAM3 interactive image demo (positive/negative points)")
     ap.add_argument("--image", default=None, help="Optional image path. If omitted, a file dialog opens.")
     ap.add_argument("--checkpoint", default=os.getenv("SAM3_CHECKPOINT", ""),
                     help="Optional local sam3.pt path (avoids HF download).")
-    ap.add_argument("--device", default=("cuda" if torch.cuda.is_available() else "cpu"))
+    ap.add_argument("--device", default=("cuda" if torch.cuda.is_available() else "cpu"),
+                    choices=["cuda", "cpu"])
     ap.add_argument("--max-side", type=int, default=1200, help="Max display size for interactive window.")
     args = ap.parse_args()
 
-    if args.device != "cuda":
-        raise SystemExit(
-            "This interactive point demo uses SAM3's instance-interactivity predictor, "
-            "which is CUDA-oriented in the upstream stack. Use --device cuda."
-        )
-
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA is not available. This interactive predictor path expects CUDA.")
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("CUDA requested but torch.cuda.is_available() is False.")
 
     _ensure_sam3_on_path()
-    from sam3.model_builder import build_sam3_image_model  # upstream builder
+    from sam3.model_builder import build_sam3_image_model
+    from sam3.model.sam3_image_processor import Sam3Processor
 
     # Pick image
     img_path = args.image or pick_image_file()
     if not img_path:
         raise SystemExit("No image selected.")
 
-    img_bgr = cv2.imread(img_path, cv2.IMREAD_COLOR)
-    if img_bgr is None:
-        raise SystemExit(f"Could not read image: {img_path}")
-
+    # Load with PIL for SAM3 (avoid ndarray shape ambiguity in Sam3Processor.set_image)
+    img_pil = Image.open(img_path).convert("RGB")
+    img_rgb = np.array(img_pil)  # HWC RGB
+    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
     H, W = img_bgr.shape[:2]
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
     ckpt = args.checkpoint.strip() or None
 
-    # Build SAM3 with instance interactivity enabled (gives model.inst_interactive_predictor)
+    # Build model with instance interactivity enabled (required for predict_inst)
     model = build_sam3_image_model(
         checkpoint_path=ckpt,
         load_from_HF=(ckpt is None),
-        device="cuda",
+        device=args.device,
         eval_mode=True,
+        enable_segmentation=True,
         enable_inst_interactivity=True,
-        enable_segmentation=False,  # not needed for point-based interactive masks
     )
 
-    predictor = getattr(model, "inst_interactive_predictor", None)
-    if predictor is None:
-        raise SystemExit("Model was built without inst_interactive_predictor. (enable_inst_interactivity=True required)")
+    # Build inference state once (backbone_out cached here)
+    processor = Sam3Processor(model, device=args.device, confidence_threshold=0.5)
+    state = processor.set_image(img_pil, state={})
 
-    # Set image embeddings once
-    predictor.set_image(img_rgb)
+    # Ensure sam2_backbone_out exists (predict_inst uses it)
+    bb = state.get("backbone_out", {})
+    if "sam2_backbone_out" not in bb:
+        raise SystemExit(
+            "backbone_out did not contain 'sam2_backbone_out'. "
+            "This interactive point path requires enable_inst_interactivity=True."
+        )
 
     disp_base, scale = compute_display_base(img_bgr, max_side=args.max_side)
 
@@ -130,18 +134,16 @@ def main() -> int:
 
     def redraw():
         vis = disp_base.copy()
-
         if last_mask_disp is not None:
             vis = green_overlay(vis, last_mask_disp, alpha=0.5)
 
-        # draw points
         for (px, py), lab in zip(points, labels):
             x = int(px * scale)
             y = int(py * scale)
             col = (0, 0, 255) if lab == 1 else (255, 0, 0)  # red=pos, blue=neg
             cv2.circle(vis, (x, y), 6, col, -1)
 
-        cv2.imshow("SAM3 Interactive (L=pos, R=neg, M/reset, u=undo, r=reset, ESC=quit)", vis)
+        cv2.imshow("SAM3 Points (L=pos, R=neg, M/r=reset, u=undo, ESC/q=quit)", vis)
 
     def run_predict():
         nonlocal last_mask_disp
@@ -150,29 +152,30 @@ def main() -> int:
             redraw()
             return
 
-        pc = np.asarray(points, dtype=np.float32)  # pixel coords
-        pl = np.asarray(labels, dtype=np.int32)
+        pc = np.asarray(points, dtype=np.float32)     # (N,2) in pixels (x,y)
+        pl = np.asarray(labels, dtype=np.int32)       # (N,) 0/1
 
-        masks, scores, _lowres = predictor.predict(
+        # This uses Sam3Image.predict_inst which reuses backbone_out["sam2_backbone_out"]
+        # and calls inst_interactive_predictor.predict under the hood. :contentReference[oaicite:2]{index=2}
+        masks, scores, _lowres = model.predict_inst(
+            state,
             point_coords=pc,
             point_labels=pl,
             box=None,
             mask_input=None,
             multimask_output=True,
             return_logits=False,
-            normalize_coords=True,  # True means input coords are absolute pixels; SAM2Transforms will normalize.
+            normalize_coords=True,   # pixels -> normalized via SAM2Transforms :contentReference[oaicite:3]{index=3}
         )
 
-        # masks: [C,H,W] boolean (return_logits=False); scores: [C]
         if masks is None or len(masks) == 0:
             last_mask_disp = None
             redraw()
             return
 
         best = int(np.argmax(scores)) if scores is not None and len(scores) else 0
-        mask_hw = masks[best].astype(bool)
+        mask_hw = masks[best].astype(bool)  # HxW at original resolution
 
-        # resize mask to display
         if scale != 1.0:
             mask_disp = cv2.resize(mask_hw.astype(np.uint8), (disp_base.shape[1], disp_base.shape[0]),
                                    interpolation=cv2.INTER_NEAREST).astype(bool)
@@ -196,7 +199,6 @@ def main() -> int:
         run_predict()
 
     def mouse_cb(event, x, y, flags, param):
-        # map display -> original pixel coords
         px = int(x / scale)
         py = int(y / scale)
         px = max(0, min(W - 1, px))
@@ -218,21 +220,21 @@ def main() -> int:
             run_predict()
             return
 
-    cv2.namedWindow("SAM3 Interactive (L=pos, R=neg, M/reset, u=undo, r=reset, ESC=quit)", cv2.WINDOW_AUTOSIZE)
-    cv2.setMouseCallback("SAM3 Interactive (L=pos, R=neg, M/reset, u=undo, r=reset, ESC=quit)", mouse_cb)
+    cv2.namedWindow("SAM3 Points (L=pos, R=neg, M/r=reset, u=undo, ESC/q=quit)", cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback("SAM3 Points (L=pos, R=neg, M/r=reset, u=undo, ESC/q=quit)", mouse_cb)
 
     print("[INFO] Controls:")
     print("  L-click = positive point")
     print("  R-click = negative point")
     print("  M-click = reset")
-    print("  u      = undo last point")
     print("  r      = reset")
+    print("  u      = undo last point")
     print("  ESC/q  = quit")
 
     redraw()
     while True:
         k = cv2.waitKey(20) & 0xFF
-        if k in (27, ord("q")):  # ESC or q
+        if k in (27, ord("q")):
             break
         if k == ord("r"):
             reset_all()
