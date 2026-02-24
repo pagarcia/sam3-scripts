@@ -1,0 +1,7 @@
+numpy<2
+opencv-python<4.12
+pillow
+tqdm
+PyQt5
+# Transformers SAM3 backend (works on Apple Silicon)
+git+https://github.com/huggingface/transformers
