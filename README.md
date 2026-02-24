@@ -22,7 +22,19 @@ git clone https://github.com/facebookresearch/sam3.git
 git clone https://github.com/pagarcia/sam3-scripts.git
 ````
 
-Create a venv, install torch (pick the right CUDA wheel for your system), then:
+Create a venv, install torch (pick the right CUDA wheel for your system):
+
+```powershell
+# Create + activate venv
+cd sam3-scripts
+py -3.12 -m venv sam3_env
+.\sam3_env\Scripts\Activate.ps1
+
+# Tooling (SAM3 currently needs setuptools<82)
+python -m pip install -U pip wheel "setuptools<82"
+
+# PyTorch (CUDA 12.6, matches upstream recommendation)
+pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 
 ```bash
 pip install -e ./sam3
