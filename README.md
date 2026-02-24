@@ -4,25 +4,58 @@ Small, public demo scripts for **Segment Anything Model 3 (SAM3)**.
 
 This repo supports two backends:
 
-- **Windows (CUDA)**: uses the upstream `facebookresearch/sam3` repo (local clone) + CUDA.
+- **Windows (CUDA / upstream SAM3)**: uses the upstream `facebookresearch/sam3` repo (local sibling clone) + CUDA.
   - Scripts: `scripts/sam3_image_demo.py`, `scripts/sam3_video_demo.py`
-- **macOS (Apple Silicon)**: uses the **Transformers** SAM3 implementation + MPS/CPU.
+  - Deps: `requirements_win.txt`
+- **macOS (Apple Silicon / Transformers)**: uses the **Transformers** SAM3 implementation + MPS/CPU.
   - Scripts: `scripts/sam3_image_demo_hf.py`, `scripts/sam3_video_demo_hf.py`
+  - Deps: `requirements_mac.txt`
 
-> **Checkpoints / weights are gated**: request access on Hugging Face and login with `hf auth login` before first run.
+---
+
+## Hugging Face access + login (gated weights)
+
+SAM3 weights on Hugging Face are **gated**.
+
+1) **Request access** (one-time, per Hugging Face account):
+   - Go to the model page on Hugging Face (e.g. `facebook/sam3`)
+   - Click **Request access** and accept the terms (approval can take time).
+
+2) **Log in locally** (per machine / per environment):
+
+```bash
+hf auth login
+````
+
+This stores a token under your user profile (so future runs won’t prompt again) and allows `transformers` / `huggingface_hub` (and the upstream scripts if they download from HF) to download the weights.
+
+If the `hf` command is not found, install/upgrade the hub package:
+
+```bash
+pip install -U huggingface_hub
+```
+
+3. **Caching**
+   Once downloaded, weights are cached locally and won’t re-download unless you clear the cache. Default cache location is typically:
+
+* macOS/Linux: `~/.cache/huggingface/`
+* Windows: `%USERPROFILE%\.cache\huggingface\`
+
+Tip: if you’re on a machine without internet access, download once on a connected machine and copy the cache folder.
 
 ---
 
 ## Windows setup (CUDA, upstream SAM3)
 
 ### 1) Clone (sibling repos)
+
 From a parent folder:
 
 ```powershell
 git clone https://github.com/facebookresearch/sam3.git
 git clone https://github.com/pagarcia/sam3-scripts.git
 cd sam3-scripts
-````
+```
 
 ### 2) Create + activate venv
 
@@ -45,7 +78,7 @@ pip install -e ..\sam3
 pip install -r .\requirements_win.txt
 ```
 
-### 5) Hugging Face auth (for gated weights)
+### 5) Login to Hugging Face (gated weights)
 
 ```powershell
 hf auth login
@@ -53,13 +86,13 @@ hf auth login
 
 ### 6) Run demos
 
-**Image (interactive points, no output file):**
+**Image (interactive points; file picker opens; no output file written):**
 
 ```powershell
 python .\scripts\sam3_image_demo.py
 ```
 
-**Video (interactive frame 0 → headless processing → saves overlay video next to input):**
+**Video (interactive frame 0 → headless processing → writes overlay video next to input):**
 
 ```powershell
 python .\scripts\sam3_video_demo.py
@@ -75,7 +108,7 @@ python .\scripts\sam3_video_demo.py --checkpoint C:\path\to\sam3.pt
 
 ---
 
-## macOS setup (Transformers + MPS)
+## macOS setup (Transformers + MPS/CPU)
 
 > Recommended: **Python 3.12/3.13** for best wheel availability.
 
@@ -106,39 +139,21 @@ pip install torch torchvision
 pip install -r requirements_mac.txt
 ```
 
-### 5) Hugging Face access + login (gated weights)
+### 5) Login to Hugging Face (gated weights)
 
-SAM3 model weights on Hugging Face are **gated**.
-
-1) **Request access** (one-time, per Hugging Face account):
-   - Go to the model page on Hugging Face (e.g. `facebook/sam3`)
-   - Click **Request access** and accept the terms (approval can take time).
-
-2) **Log in locally** (per machine / per environment):
 ```bash
 hf auth login
-````
-
-This stores a token under your user profile (so future runs won’t prompt again) and allows `transformers` / `huggingface_hub` to download the weights.
-
-3. **Caching**
-   Once downloaded, weights are cached locally and won’t re-download unless you clear the cache.
-   Default cache location is typically:
-
-* macOS/Linux: `~/.cache/huggingface/`
-* Windows: `%USERPROFILE%\.cache\huggingface\`
-
-Tip: if you’re on a machine without internet access, download once on a connected machine and copy the cache folder.
+```
 
 ### 6) Run demos
 
-**Image (interactive points):**
+**Image (interactive points; file picker opens):**
 
 ```bash
 python scripts/sam3_image_demo_hf.py
 ```
 
-**Video (interactive frame 0 → headless processing → saves overlay video next to input):**
+**Video (interactive frame 0 → headless processing → writes overlay video next to input):**
 
 ```bash
 python scripts/sam3_video_demo_hf.py
@@ -156,10 +171,11 @@ python scripts/sam3_image_demo_hf.py --model-id facebook/sam3
 
 ## Notes
 
-* **First run downloads weights** (can be several GB). Downloads are cached under `~/.cache/huggingface/` (macOS/Linux) or the Hugging Face cache directory on Windows (same default path under your user profile).
-* **macOS uses the Transformers backend** because the upstream `facebookresearch/sam3` repo is CUDA/Triton-oriented and is not mac-friendly in practice.
+* **First run downloads weights** (can be several GB). Downloads are cached under the Hugging Face cache directory (see section above).
+* **macOS uses the Transformers backend** because upstream `facebookresearch/sam3` is CUDA/Triton-oriented and is not mac-friendly in practice.
 * **Windows has two working options**:
-  * **Upstream backend (`sam3_image_demo.py`, `sam3_video_demo.py`)**: fastest on NVIDIA GPUs and closest to Meta’s reference implementation, but requires more platform-specific deps (e.g., Triton on Windows).
+
+  * **Upstream backend (`sam3_image_demo.py`, `sam3_video_demo.py`)**: fastest on NVIDIA GPUs and closest to Meta’s reference implementation, but requires more platform-specific deps (e.g. Triton on Windows).
   * **Transformers backend (`*_hf.py`)**: also works on Windows (CUDA or CPU) and is usually simpler to install, but the codepath is a reimplementation and may differ slightly in behavior/performance compared to upstream.
 
 ```
