@@ -169,6 +169,22 @@ python scripts/sam3_image_demo_hf.py --model-id facebook/sam3
 
 ---
 
+## Mask output format (for downstream use)
+
+All demos compute a **binary segmentation mask** in the original image/video resolution:
+
+- `mask_hw`: NumPy `bool` array of shape `(H, W)`
+  - `True` = foreground
+  - `False` = background
+
+The “green overlay” video/image is just visualization. If you need the mask for your app:
+- Convert to uint8: `mask_u8 = mask_hw.astype(np.uint8) * 255`
+- Save as PNG, compute contours, apply as alpha, or bit-pack for compact storage.
+
+In the scripts:
+- Image demos choose the best mask from multiple candidates (multimask) using the model’s score.
+- Video demos produce one mask per frame (and currently save an overlay MP4). You can also save per-frame masks by writing `mask_u8` inside the loop.
+
 ## Notes
 
 * **First run downloads weights** (can be several GB). Downloads are cached under the Hugging Face cache directory (see section above).
