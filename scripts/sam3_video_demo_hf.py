@@ -115,6 +115,9 @@ def main() -> int:
             last_mask_disp = None
             return
 
+        # IMPORTANT: avoid accumulating tracking memory while "previewing" frame 0
+        inference_session.reset_inference_session()
+
         pts = [[[[float(x), float(y)] for (x, y) in points]]]
         labs = [[[int(v) for v in labels]]]
 
@@ -124,22 +127,23 @@ def main() -> int:
             obj_ids=int(args.obj_id),
             input_points=pts,
             input_labels=labs,
-            original_size=orig0,      # required in streaming mode :contentReference[oaicite:9]{index=9}
+            original_size=orig0,      # required in streaming mode
             clear_old_inputs=True,
         )
 
-        out0 = model(inference_session=inference_session, frame=pixel0)
+        # Also avoid mutating memory on preview
+        out0 = model(inference_session=inference_session, frame=pixel0, frame_idx=0, run_mem_encoder=False)
 
-        # Do postprocess on CPU to avoid MPS pin_memory/device gotchas.
         masks0 = processor.post_process_masks(
             [out0.pred_masks.cpu()],
             original_sizes=[orig0],
             binarize=True,
             max_hole_area=0.0,
             max_sprinkle_area=0.0,
-        )[0]  # expected [num_obj, 1, H, W] :contentReference[oaicite:10]{index=10}
+        )[0]
 
         mask_hw = (masks0[0, 0] > 0).numpy()
+
         if scale != 1.0:
             last_mask_disp = cv2.resize(mask_hw.astype(np.uint8), (base.shape[1], base.shape[0]),
                                         interpolation=cv2.INTER_NEAREST).astype(bool)
