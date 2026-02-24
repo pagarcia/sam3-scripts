@@ -1,93 +1,145 @@
 # sam3-scripts
 
-Small, public demo scripts for **Segment Anything Model 3 (SAM3)**:
-- Image segmentation (text prompt and/or box prompt)
-- Video segmentation/tracking (text/box prompts OR SAM2-style point tracking via the SAM3 tracker)
+Small, public demo scripts for **Segment Anything Model 3 (SAM3)**.
 
-> Checkpoints are gated: request access on Hugging Face and login (`hf auth login`).  
-> (See official SAM3 instructions.)  
+This repo supports two backends:
 
-## Prereqs
-The official SAM3 repo recommends:
-- Python 3.12+
-- PyTorch 2.7+
-- CUDA 12.6+ GPU for practical use
-(See upstream README.)  
+- **Windows (CUDA)**: uses the upstream `facebookresearch/sam3` repo (local clone) + CUDA.
+  - Scripts: `scripts/sam3_image_demo.py`, `scripts/sam3_video_demo.py`
+- **macOS (Apple Silicon)**: uses the **Transformers** SAM3 implementation + MPS/CPU.
+  - Scripts: `scripts/sam3_image_demo_hf.py`, `scripts/sam3_video_demo_hf.py`
 
-## Setup (sibling clone workflow)
+> **Checkpoints / weights are gated**: request access on Hugging Face and login with `hf auth login` before first run.
+
+---
+
+## Windows setup (CUDA, upstream SAM3)
+
+### 1) Clone (sibling repos)
 From a parent folder:
 
-```bash
+```powershell
 git clone https://github.com/facebookresearch/sam3.git
 git clone https://github.com/pagarcia/sam3-scripts.git
+cd sam3-scripts
 ````
 
-Create a venv, install torch (pick the right CUDA wheel for your system):
+### 2) Create + activate venv
 
 ```powershell
-# Create + activate venv
-cd sam3-scripts
 py -3.12 -m venv sam3_env
 .\sam3_env\Scripts\Activate.ps1
-
-# Tooling (SAM3 currently needs setuptools<82)
 python -m pip install -U pip wheel "setuptools<82"
-
-# PyTorch (CUDA 12.6, matches upstream recommendation)
-pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
-
-```bash
-pip install -e ./sam3
-pip install -r ./sam3-scripts/requirements.txt
 ```
 
-### Checkpoints (required)
+### 3) Install PyTorch (CUDA 12.6)
 
-Request access to `facebook/sam3` on HF, then:
+```powershell
+pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+```
+
+### 4) Install upstream SAM3 + demo deps
+
+```powershell
+pip install -e ..\sam3
+pip install -r .\requirements_win.txt
+```
+
+### 5) Hugging Face auth (for gated weights)
+
+```powershell
+hf auth login
+```
+
+### 6) Run demos
+
+**Image (interactive points, no output file):**
+
+```powershell
+python .\scripts\sam3_image_demo.py
+```
+
+**Video (interactive frame 0 → headless processing → saves overlay video next to input):**
+
+```powershell
+python .\scripts\sam3_video_demo.py
+```
+
+Options:
+
+```powershell
+python .\scripts\sam3_video_demo.py --max-frames 200
+python .\scripts\sam3_video_demo.py --out C:\path\to\out.mp4
+python .\scripts\sam3_video_demo.py --checkpoint C:\path\to\sam3.pt
+```
+
+---
+
+## macOS setup (Transformers + MPS)
+
+> Recommended: **Python 3.12/3.13** for best wheel availability.
+
+### 1) Clone
+
+```bash
+git clone https://github.com/pagarcia/sam3-scripts.git
+cd sam3-scripts
+```
+
+### 2) Create + activate venv
+
+```bash
+python3 -m venv sam3_env
+source sam3_env/bin/activate
+python -m pip install -U pip
+```
+
+### 3) Install PyTorch (Apple build)
+
+```bash
+pip install torch torchvision
+```
+
+### 4) Install mac deps (Transformers backend + PyQt5 dialogs)
+
+```bash
+pip install -r requirements_mac.txt
+```
+
+### 5) Hugging Face auth (gated weights)
 
 ```bash
 hf auth login
 ```
 
-Optionally set a local checkpoint:
+### 6) Run demos
+
+**Image (interactive points):**
 
 ```bash
-export SAM3_CHECKPOINT=/path/to/sam3.pt
+python scripts/sam3_image_demo_hf.py
 ```
 
-## Image demo
-
-Text prompt:
+**Video (interactive frame 0 → headless processing → saves overlay video next to input):**
 
 ```bash
-python sam3-scripts/scripts/sam3_image_demo.py --image ./my.jpg --text "person" --out out.png --show
+python scripts/sam3_video_demo_hf.py
 ```
 
-Box prompt (draw interactively):
+Options:
 
 ```bash
-python sam3-scripts/scripts/sam3_image_demo.py --image ./my.jpg --interactive-box --out out.png --show
+python scripts/sam3_video_demo_hf.py --max-frames 200
+python scripts/sam3_video_demo_hf.py --out /path/to/out.mp4
+python scripts/sam3_image_demo_hf.py --model-id facebook/sam3
 ```
 
-## Video demo
+---
 
-Concept tracking with text prompt:
+## Notes
 
-```bash
-python sam3-scripts/scripts/sam3_video_demo.py --video ./my.mp4 --prompt text --text "person" --out out.mp4
+* **First run downloads weights** (can be several GB). Downloads are cached under `~/.cache/huggingface/`.
+* macOS uses **Transformers** because upstream `facebookresearch/sam3` depends on Triton/CUDA and is not mac-friendly.
+* Windows backend is fastest when you have an NVIDIA GPU.
+
 ```
-
-Point-based tracking (SAM2-style) on first frame:
-
-```bash
-python sam3-scripts/scripts/sam3_video_demo.py --video ./my.mp4 --prompt points --out out.mp4
-# L-click = positive, R-click = negative, M-click = reset, Enter = run
-```
-
-Box prompt (draw interactively on frame 0):
-
-```bash
-python sam3-scripts/scripts/sam3_video_demo.py --video ./my.mp4 --prompt box --interactive-box --out out.mp4
-```
-
-````
