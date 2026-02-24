@@ -31,7 +31,6 @@ def _ensure_sam3_on_path() -> None:
 
 
 def pick_video_file() -> Optional[str]:
-    """Native file picker (Tkinter). Returns path or None."""
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -47,10 +46,7 @@ def pick_video_file() -> Optional[str]:
 
     path = filedialog.askopenfilename(
         title="Select a video",
-        filetypes=[
-            ("Videos", "*.mp4;*.mkv;*.avi;*.mov;*.m4v"),
-            ("All files", "*.*"),
-        ],
+        filetypes=[("Videos", "*.mp4;*.mkv;*.avi;*.mov;*.m4v"), ("All files", "*.*")],
     )
     root.destroy()
     return path or None
@@ -73,183 +69,98 @@ def green_overlay(bgr: np.ndarray, mask_bool: np.ndarray, alpha: float = 0.5) ->
     return cv2.addWeighted(bgr, 1.0, color, alpha, 0.0)
 
 
-def _interactive_points(first_bgr: np.ndarray, max_side: int = 1200) -> Tuple[Optional[List[Tuple[int, int]]], Optional[List[int]]]:
+def _load_ckpt_dict(path: str) -> dict:
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    if isinstance(ckpt, dict) and "model" in ckpt and isinstance(ckpt["model"], dict):
+        return ckpt["model"]
+    if isinstance(ckpt, dict):
+        return ckpt
+    raise RuntimeError("Unexpected checkpoint format")
+
+
+def _build_tracker_from_sam3_ckpt(checkpoint_path: str):
     """
-    Collect pos/neg clicks on the first frame.
-      L-click = positive
-      R-click = negative
-      M-click or 'r' = reset
-      'u' = undo
-      Enter = accept
-      ESC/q = cancel
-    Returns (points_px, labels) or (None, None) on cancel.
+    Build Sam3TrackerPredictor WITH a vision backbone and load weights:
+      - tracker.* -> tracker predictor
+      - detector.backbone.vision_backbone.* -> tracker.backbone.vision_backbone.*
     """
-    base, scale = compute_display_base(first_bgr, max_side=max_side)
-    H, W = first_bgr.shape[:2]
+    from sam3.model_builder import build_tracker
 
-    points: List[Tuple[int, int]] = []
-    labels: List[int] = []
+    # Build tracker with its own backbone (so it can run standalone on video frames)
+    tracker = build_tracker(apply_temporal_disambiguation=False, with_backbone=True)
+    tracker = tracker.cuda().eval()
 
-    def redraw():
-        vis = base.copy()
-        for (px, py), lab in zip(points, labels):
-            x = int(px * scale)
-            y = int(py * scale)
-            col = (0, 0, 255) if lab == 1 else (255, 0, 0)
-            cv2.circle(vis, (x, y), 6, col, -1)
-        cv2.imshow("SAM3 Video – points (L=pos, R=neg, M/r=reset, u=undo, Enter=OK, ESC=cancel)", vis)
+    sd_src = _load_ckpt_dict(checkpoint_path)
+    sd = {}
 
-    def reset_all():
-        points.clear()
-        labels.clear()
-        redraw()
+    # Load tracker weights
+    for k, v in sd_src.items():
+        if k.startswith("tracker."):
+            sd[k[len("tracker."):]] = v
 
-    def undo_last():
-        if points:
-            points.pop()
-            labels.pop()
-        redraw()
+    # Load vision backbone weights from detector into tracker backbone
+    det_vis_prefix = "detector.backbone.vision_backbone."
+    for k, v in sd_src.items():
+        if k.startswith(det_vis_prefix):
+            sd["backbone.vision_backbone." + k[len(det_vis_prefix):]] = v
 
-    def cb(event, x, y, flags, param):
-        # display -> original pixels
-        px = int(x / scale)
-        py = int(y / scale)
-        px = max(0, min(W - 1, px))
-        py = max(0, min(H - 1, py))
+    missing, unexpected = tracker.load_state_dict(sd, strict=False)
 
-        if event == cv2.EVENT_MBUTTONDOWN:
-            reset_all()
-            return
-        if event == cv2.EVENT_LBUTTONDOWN:
-            points.append((px, py))
-            labels.append(1)
-            redraw()
-            return
-        if event == cv2.EVENT_RBUTTONDOWN:
-            points.append((px, py))
-            labels.append(0)
-            redraw()
-            return
+    # Make autocast sane on older GPUs (Pascal doesn't support bf16 well)
+    try:
+        tracker.bf16_context.__exit__(None, None, None)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    major, _ = torch.cuda.get_device_capability()
+    cast_dtype = torch.bfloat16 if major >= 8 else torch.float16
+    tracker.bf16_context = torch.autocast(device_type="cuda", dtype=cast_dtype)  # type: ignore[attr-defined]
+    tracker.bf16_context.__enter__()  # type: ignore[attr-defined]
 
-    cv2.namedWindow("SAM3 Video – points (L=pos, R=neg, M/r=reset, u=undo, Enter=OK, ESC=cancel)", cv2.WINDOW_AUTOSIZE)
-    cv2.setMouseCallback("SAM3 Video – points (L=pos, R=neg, M/r=reset, u=undo, Enter=OK, ESC=cancel)", cb)
-
-    print("[INFO] Select points on the first frame:")
-    print("  L-click = positive, R-click = negative")
-    print("  M-click / r = reset, u = undo")
-    print("  Enter = accept, ESC/q = cancel")
-
-    redraw()
-    while True:
-        k = cv2.waitKey(20) & 0xFF
-        if k in (27, ord("q")):  # ESC/q
-            cv2.destroyAllWindows()
-            return None, None
-        if k == ord("r"):
-            reset_all()
-        if k == ord("u"):
-            undo_last()
-        if k in (13, 10):  # Enter
-            cv2.destroyAllWindows()
-            break
-
-    if not points:
-        return None, None
-    return points, labels
+    print(f"[INFO] Tracker weights loaded. missing={len(missing)} unexpected={len(unexpected)} autocast={cast_dtype}")
+    return tracker
 
 
-def _extract_mask(outputs: dict, target_obj_id: Optional[int] = None) -> Optional[np.ndarray]:
-    """
-    outputs usually contains:
-      out_obj_ids: (K,)
-      out_binary_masks: (K,H,W)
-    Return a single HxW bool mask (union or specific obj_id).
-    """
-    if outputs is None:
+def _mask_for_obj(video_res_masks, obj_ids: List[int], obj_id: int) -> Optional[np.ndarray]:
+    if video_res_masks is None:
         return None
+    m = video_res_masks
+    if isinstance(m, torch.Tensor):
+        m = m.detach().cpu().numpy()
+    m = np.asarray(m)
 
-    obj_ids = outputs.get("out_obj_ids", None)
-    masks = outputs.get("out_binary_masks", None)
-    if masks is None:
-        return None
-
-    m = np.asarray(masks)
-    if m.ndim == 2:
-        return m.astype(bool)
-
+    # Shapes seen: [N,1,H,W] or [N,H,W]
+    if m.ndim == 4 and m.shape[1] == 1:
+        m = m[:, 0]
     if m.ndim != 3:
         return None
 
-    if target_obj_id is None or obj_ids is None:
-        return np.any(m.astype(bool), axis=0)
-
-    ids = np.asarray(obj_ids).reshape(-1)
-    hit = np.where(ids == int(target_obj_id))[0]
-    if hit.size == 0:
-        return np.any(m.astype(bool), axis=0)
-    return m[int(hit[0])].astype(bool)
-
-
-def _maybe_disable_hole_fill_for_old_gpu() -> None:
-    """
-    On sm_61 (Pascal) Triton CC postprocess can spam PTXAS errors.
-    Disable by patching fill_holes_in_mask_scores to a no-op.
-    """
-    if not torch.cuda.is_available():
-        return
-    maj, _min = torch.cuda.get_device_capability()
-    if maj >= 7:
-        return
-
-    try:
-        import sam3.model.sam3_tracker_utils as stu
-
-        def _no_fill(mask, max_area, fill_holes=True, remove_sprinkles=True):
-            return mask
-
-        stu.fill_holes_in_mask_scores = _no_fill
-    except Exception:
-        pass
-
-    # sam3_video_inference imports the function by name; patch there too if loaded.
-    try:
-        import sam3.model.sam3_video_inference as svi
-
-        def _no_fill(mask, max_area, fill_holes=True, remove_sprinkles=True):
-            return mask
-
-        svi.fill_holes_in_mask_scores = _no_fill
-    except Exception:
-        pass
+    if obj_id in obj_ids:
+        idx = obj_ids.index(obj_id)
+        return (m[idx] > 0)
+    return (np.any(m > 0, axis=0))
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser("SAM3 interactive video demo (points on frame 0 -> tracking)")
-    ap.add_argument("--video", default=None, help="Optional video path. If omitted, a file dialog opens.")
-    ap.add_argument("--checkpoint", default=os.getenv("SAM3_CHECKPOINT", ""),
-                    help="Optional local sam3.pt path (avoids HF download).")
-    ap.add_argument("--obj-id", type=int, default=1, help="Tracked object id.")
-    ap.add_argument("--direction", choices=["forward", "backward", "both"], default="forward")
-    ap.add_argument("--max-frames", type=int, default=0, help="0=all, else cap propagation length.")
-    ap.add_argument("--max-side", type=int, default=1200, help="Max display side for UI windows.")
-    ap.add_argument("--out", default="", help="Optional output mp4 path (overlay). Default: no saving.")
-    ap.add_argument("--no-show", action="store_true", help="Don’t show the overlay window during tracking.")
+    ap = argparse.ArgumentParser("SAM3 video demo (SAM2-style tracker: click frame 0 -> propagate)")
+    ap.add_argument("--video", default=None, help="Optional MP4 path. If omitted, a file dialog opens.")
+    ap.add_argument("--checkpoint", default=os.getenv("SAM3_CHECKPOINT", ""), help="Optional local sam3.pt path.")
+    ap.add_argument("--obj-id", type=int, default=1)
+    ap.add_argument("--max-side", type=int, default=1200)
+    ap.add_argument("--max-frames", type=int, default=0, help="0=all")
+    ap.add_argument("--out", default="", help="Optional output mp4 (overlay). Default: no saving.")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
-        raise SystemExit(
-            "CUDA is required for SAM3 video predictor (upstream calls .cuda() internally)."
-        )
+        raise SystemExit("CUDA is required for this demo.")
 
     _ensure_sam3_on_path()
-    from sam3.model_builder import build_sam3_video_predictor
+    from sam3.model_builder import download_ckpt_from_hf
 
-    # Pick video
     video_path = args.video or pick_video_file()
     if not video_path:
         raise SystemExit("No video selected.")
 
-    # Read first frame for UI
+    # Read original first frame for UI (no resizing)
     cap0 = cv2.VideoCapture(video_path)
     if not cap0.isOpened():
         raise SystemExit(f"Cannot open video: {video_path}")
@@ -257,148 +168,202 @@ def main() -> int:
     cap0.release()
     if not ok or first is None:
         raise SystemExit("Cannot read first frame.")
+    H0, W0 = first.shape[:2]
 
-    H, W = first.shape[:2]
+    # Checkpoint
+    ckpt = args.checkpoint.strip()
+    if not ckpt:
+        ckpt = download_ckpt_from_hf()  # uses HF cache; no prompt if already logged in
+    tracker = _build_tracker_from_sam3_ckpt(ckpt)
 
-    # Build predictor (loads model on GPU)
-    ckpt = args.checkpoint.strip() or None
-    predictor = build_sam3_video_predictor(checkpoint_path=ckpt) if ckpt else build_sam3_video_predictor()
+    # Tracker inference state (loads and resizes frames internally to image_size=1008)
+    # Offloading frames to CPU saves VRAM; keep default True for 12GB cards.
+    state = tracker.init_state(video_path=video_path, offload_video_to_cpu=True, async_loading_frames=False)
 
-    # Optional: disable the Triton CC hole-fill postprocess on Pascal (sm_61)
-    _maybe_disable_hole_fill_for_old_gpu()
+    # Interactive UI on frame 0 (mask updates on each click)
+    base, scale = compute_display_base(first, max_side=args.max_side)
+    points: List[Tuple[int, int]] = []
+    labels: List[int] = []
+    last_mask_disp: Optional[np.ndarray] = None
 
-    # Start session
-    sid = predictor.handle_request({"type": "start_session", "resource_path": video_path}).get("session_id")
-    if not sid:
-        raise SystemExit("start_session failed (no session_id returned).")
+    def redraw():
+        vis = base.copy()
+        if last_mask_disp is not None:
+            vis = green_overlay(vis, last_mask_disp, alpha=0.5)
+        for (px, py), lab in zip(points, labels):
+            x = int(px * scale)
+            y = int(py * scale)
+            col = (0, 0, 255) if lab == 1 else (255, 0, 0)
+            cv2.circle(vis, (x, y), 6, col, -1)
+        cv2.imshow("SAM3 Video (L=pos R=neg u=undo r=reset Enter=track ESC=quit)", vis)
 
-    try:
-        # ---- prompt loop (allow redo) ----
-        while True:
-            points_px, labels = _interactive_points(first, max_side=args.max_side)
-            if points_px is None or labels is None:
-                return 0  # user cancelled
-
-            # Convert pixel points -> relative [0..1] coords expected by video inference.
-            points_rel = [[float(x) / float(W), float(y) / float(H)] for (x, y) in points_px]
-
-            # Add prompt on frame 0 and get immediate output for preview
-            resp = predictor.handle_request({
-                "type": "add_prompt",
-                "session_id": sid,
-                "frame_index": 0,
-                "points": points_rel,
-                "point_labels": labels,
-                "obj_id": int(args.obj_id),
-            })
-            out0 = resp.get("outputs", None)
-
-            mask0 = _extract_mask(out0, target_obj_id=int(args.obj_id))
-            base, scale = compute_display_base(first, max_side=args.max_side)
-            vis = base.copy()
-            if mask0 is not None:
-                if scale != 1.0:
-                    mask_disp = cv2.resize(mask0.astype(np.uint8),
-                                           (base.shape[1], base.shape[0]),
-                                           interpolation=cv2.INTER_NEAREST).astype(bool)
-                else:
-                    mask_disp = mask0
-                vis = green_overlay(vis, mask_disp, alpha=0.5)
-
-            # draw points on preview
-            for (px, py), lab in zip(points_px, labels):
-                x = int(px * scale)
-                y = int(py * scale)
-                col = (0, 0, 255) if lab == 1 else (255, 0, 0)
-                cv2.circle(vis, (x, y), 6, col, -1)
-
-            cv2.imshow("Preview (Enter=track, r=redo points, ESC=quit)", vis)
-            print("[INFO] Preview: Enter=track, r=redo, ESC/q=quit")
-            while True:
-                k = cv2.waitKey(20) & 0xFF
-                if k in (27, ord("q")):
-                    cv2.destroyAllWindows()
-                    return 0
-                if k == ord("r"):
-                    cv2.destroyAllWindows()
-                    predictor.handle_request({"type": "reset_session", "session_id": sid})
-                    break  # back to point picking
-                if k in (13, 10):
-                    cv2.destroyAllWindows()
-                    break  # accept and track
-            if k in (13, 10):
-                break  # accepted
-
-        # ---- propagate + overlay ----
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise RuntimeError(f"Cannot open video: {video_path}")
-
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if fps <= 0:
-            fps = 25.0
-
-        out_path = args.out.strip()
-        writer = None
-        if out_path:
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(out_path, fourcc, fps, (W, H))
-            if not writer.isOpened():
-                raise RuntimeError(f"Cannot open VideoWriter: {out_path}")
-
-        stream_req = {
-            "type": "propagate_in_video",
-            "session_id": sid,
-            "propagation_direction": args.direction,
-            "start_frame_index": 0,
-            "max_frame_num_to_track": (None if args.max_frames <= 0 else int(args.max_frames)),
-        }
-
-        if not args.no_show:
-            cv2.namedWindow("SAM3 Tracking (ESC/q=stop)", cv2.WINDOW_AUTOSIZE)
-
-        for item in predictor.handle_stream_request(stream_req):
-            fi = int(item.get("frame_index", -1))
-            outputs = item.get("outputs", None)
-            if fi < 0 or outputs is None:
-                continue
-
-            # Seek to that frame and read it
-            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                continue
-
-            mask = _extract_mask(outputs, target_obj_id=int(args.obj_id))
-            if mask is not None:
-                frame = green_overlay(frame, mask.astype(bool), alpha=0.5)
-
-            if writer is not None:
-                writer.write(frame)
-
-            if not args.no_show:
-                cv2.imshow("SAM3 Tracking (ESC/q=stop)", frame)
-                k = cv2.waitKey(1) & 0xFF
-                if k in (27, ord("q")):
-                    print("[INFO] Stopping early.")
-                    break
-
-        cap.release()
-        if writer is not None:
-            writer.release()
-            print(f"[OK] Wrote: {out_path}")
-
-        if not args.no_show:
-            cv2.destroyAllWindows()
-
-        return 0
-
-    finally:
-        # Always close session
+    def clear_frame0():
         try:
-            predictor.handle_request({"type": "close_session", "session_id": sid})
+            tracker.clear_all_points_in_frame(state, frame_idx=0, obj_id=int(args.obj_id), need_output=False)
         except Exception:
             pass
+
+    def replay_all():
+        nonlocal last_mask_disp
+        clear_frame0()
+        last_mask_disp = None
+        out_mask = None
+        for (px, py), lab in zip(points, labels):
+            pt_rel = np.array([[px / float(W0), py / float(H0)]], dtype=np.float32)
+            lab_arr = np.array([lab], dtype=np.int32)
+            _, obj_ids, _, video_res_masks = tracker.add_new_points_or_box(
+                state,
+                frame_idx=0,
+                obj_id=int(args.obj_id),
+                points=pt_rel,
+                labels=lab_arr,
+                clear_old_points=False,
+                rel_coordinates=True,
+            )
+            out_mask = _mask_for_obj(video_res_masks, [int(x) for x in obj_ids], int(args.obj_id))
+
+        if out_mask is not None:
+            if scale != 1.0:
+                last_mask_disp = cv2.resize(out_mask.astype(np.uint8), (base.shape[1], base.shape[0]),
+                                            interpolation=cv2.INTER_NEAREST).astype(bool)
+            else:
+                last_mask_disp = out_mask.astype(bool)
+
+    def add_click(px: int, py: int, lab: int):
+        nonlocal last_mask_disp
+        points.append((px, py))
+        labels.append(lab)
+
+        pt_rel = np.array([[px / float(W0), py / float(H0)]], dtype=np.float32)
+        lab_arr = np.array([lab], dtype=np.int32)
+
+        _, obj_ids, _, video_res_masks = tracker.add_new_points_or_box(
+            state,
+            frame_idx=0,
+            obj_id=int(args.obj_id),
+            points=pt_rel,
+            labels=lab_arr,
+            clear_old_points=False,
+            rel_coordinates=True,
+        )
+        out_mask = _mask_for_obj(video_res_masks, [int(x) for x in obj_ids], int(args.obj_id))
+        if out_mask is None:
+            last_mask_disp = None
+            return
+
+        if scale != 1.0:
+            last_mask_disp = cv2.resize(out_mask.astype(np.uint8), (base.shape[1], base.shape[0]),
+                                        interpolation=cv2.INTER_NEAREST).astype(bool)
+        else:
+            last_mask_disp = out_mask.astype(bool)
+
+    def undo_last():
+        if not points:
+            return
+        points.pop()
+        labels.pop()
+        replay_all()
+
+    def reset_all():
+        nonlocal last_mask_disp
+        points.clear()
+        labels.clear()
+        last_mask_disp = None
+        clear_frame0()
+
+    def mouse_cb(event, x, y, flags, param):
+        px = int(x / scale)
+        py = int(y / scale)
+        px = max(0, min(W0 - 1, px))
+        py = max(0, min(H0 - 1, py))
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            add_click(px, py, 1)
+            redraw()
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            add_click(px, py, 0)
+            redraw()
+        elif event == cv2.EVENT_MBUTTONDOWN:
+            reset_all()
+            redraw()
+
+    cv2.namedWindow("SAM3 Video (L=pos R=neg u=undo r=reset Enter=track ESC=quit)", cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback("SAM3 Video (L=pos R=neg u=undo r=reset Enter=track ESC=quit)", mouse_cb)
+
+    print("[INFO] Controls: L=pos, R=neg, u=undo, r=reset, Enter=track, ESC/q=quit")
+    redraw()
+
+    # Wait for Enter / quit
+    while True:
+        k = cv2.waitKey(20) & 0xFF
+        if k in (27, ord("q")):
+            cv2.destroyAllWindows()
+            return 0
+        if k == ord("r"):
+            reset_all()
+            redraw()
+        if k == ord("u"):
+            undo_last()
+            redraw()
+        if k in (13, 10):  # Enter
+            if not points:
+                print("[WARN] No points. Add at least one positive click.")
+                continue
+            cv2.destroyAllWindows()
+            break
+
+    # Propagate forward
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise SystemExit(f"Cannot open video: {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 25.0
+
+    writer = None
+    if args.out.strip():
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(args.out.strip(), fourcc, fps, (W0, H0))
+        if not writer.isOpened():
+            raise SystemExit(f"Cannot open VideoWriter: {args.out.strip()}")
+
+    cv2.namedWindow("SAM3 Tracking (ESC/q=stop)", cv2.WINDOW_AUTOSIZE)
+
+    max_frames = None if int(args.max_frames) <= 0 else int(args.max_frames)
+
+    for frame_idx, obj_ids, _low_res, video_res_masks, _obj_scores in tracker.propagate_in_video(
+        state,
+        start_frame_idx=0,
+        max_frame_num_to_track=max_frames,
+        reverse=False,
+        tqdm_disable=True,
+        propagate_preflight=True,
+    ):
+        # Read original frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            continue
+
+        mask = _mask_for_obj(video_res_masks, [int(x) for x in obj_ids], int(args.obj_id))
+        if mask is not None:
+            frame = green_overlay(frame, mask, alpha=0.5)
+
+        if writer is not None:
+            writer.write(frame)
+
+        cv2.imshow("SAM3 Tracking (ESC/q=stop)", frame)
+        k = cv2.waitKey(1) & 0xFF
+        if k in (27, ord("q")):
+            print("[INFO] Stopped early.")
+            break
+
+    cap.release()
+    if writer is not None:
+        writer.release()
+        print(f"[OK] Wrote {args.out.strip()}")
+    cv2.destroyAllWindows()
+    return 0
 
 
 if __name__ == "__main__":
