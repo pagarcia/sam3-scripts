@@ -7,6 +7,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Optional, Tuple, List
+from tqdm import tqdm
 
 import numpy as np
 import cv2
@@ -67,6 +68,20 @@ def green_overlay(bgr: np.ndarray, mask_bool: np.ndarray, alpha: float = 0.5) ->
     color = np.zeros_like(bgr)
     color[fg] = (0, 255, 0)
     return cv2.addWeighted(bgr, 1.0, color, alpha, 0.0)
+
+
+def default_out_path(video_path: str) -> str:
+    p = Path(video_path)
+    base = p.with_name(p.stem + "_sam3_overlay.mp4")
+    if not base.exists():
+        return str(base)
+    # avoid overwrite: _2, _3, ...
+    i = 2
+    while True:
+        cand = p.with_name(f"{p.stem}_sam3_overlay_{i}.mp4")
+        if not cand.exists():
+            return str(cand)
+        i += 1
 
 
 def _load_ckpt_dict(path: str) -> dict:
@@ -312,57 +327,72 @@ def main() -> int:
             cv2.destroyAllWindows()
             break
 
-    # Propagate forward
+    # Propagate forward (NO UI) + save output next to input
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise SystemExit(f"Cannot open video: {video_path}")
+
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps <= 0:
         fps = 25.0
 
-    writer = None
-    if args.out.strip():
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(args.out.strip(), fourcc, fps, (W0, H0))
-        if not writer.isOpened():
-            raise SystemExit(f"Cannot open VideoWriter: {args.out.strip()}")
-
-    cv2.namedWindow("SAM3 Tracking (ESC/q=stop)", cv2.WINDOW_AUTOSIZE)
-
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     max_frames = None if int(args.max_frames) <= 0 else int(args.max_frames)
+    total = frame_count if frame_count > 0 else None
+    if total is not None and max_frames is not None:
+        total = min(total, max_frames)
 
-    for frame_idx, obj_ids, _low_res, video_res_masks, _obj_scores in tracker.propagate_in_video(
-        state,
-        start_frame_idx=0,
-        max_frame_num_to_track=max_frames,
-        reverse=False,
-        tqdm_disable=True,
-        propagate_preflight=True,
-    ):
-        # Read original frame
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            continue
+    out_path = args.out.strip() if args.out.strip() else default_out_path(video_path)
 
-        mask = _mask_for_obj(video_res_masks, [int(x) for x in obj_ids], int(args.obj_id))
-        if mask is not None:
-            frame = green_overlay(frame, mask, alpha=0.5)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(out_path, fourcc, fps, (W0, H0))
+    if not writer.isOpened():
+        raise SystemExit(f"Cannot open VideoWriter: {out_path}")
 
-        if writer is not None:
+    print(f"[INFO] Writing overlay video to: {out_path}")
+
+    pbar = tqdm(total=total, desc="Tracking", unit="frame")
+
+    try:
+        cur_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+
+        for frame_idx, obj_ids, _low_res, video_res_masks, _obj_scores in tracker.propagate_in_video(
+            state,
+            start_frame_idx=0,
+            max_frame_num_to_track=max_frames,
+            reverse=False,
+            tqdm_disable=True,
+            propagate_preflight=True,
+        ):
+            fi = int(frame_idx)
+
+            # keep OpenCV aligned with the yielded index
+            if cur_idx != fi:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+                cur_idx = fi
+
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                # still advance progress so bar doesn't stall forever
+                pbar.update(1)
+                cur_idx += 1
+                continue
+
+            mask = _mask_for_obj(video_res_masks, [int(x) for x in obj_ids], int(args.obj_id))
+            if mask is not None:
+                frame = green_overlay(frame, mask, alpha=0.5)
+
             writer.write(frame)
 
-        cv2.imshow("SAM3 Tracking (ESC/q=stop)", frame)
-        k = cv2.waitKey(1) & 0xFF
-        if k in (27, ord("q")):
-            print("[INFO] Stopped early.")
-            break
+            pbar.update(1)
+            cur_idx += 1
 
-    cap.release()
-    if writer is not None:
+    finally:
+        pbar.close()
+        cap.release()
         writer.release()
-        print(f"[OK] Wrote {args.out.strip()}")
-    cv2.destroyAllWindows()
+
+    print(f"[OK] Saved: {out_path}")
     return 0
 
 
