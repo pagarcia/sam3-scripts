@@ -143,7 +143,7 @@ def main() -> int:
     if args.text:
         state = processor.set_text_prompt(prompt=args.text, state=state)
 
-    # Box prompt (Sam3Processor expects normalized [cx,cy,w,h]) :contentReference[oaicite:2]{index=2}
+    # Box prompt (Sam3Processor expects normalized [cx,cy,w,h])
     if box_xyxy is not None:
         x1, y1, x2, y2 = box_xyxy
         x1 = int(np.clip(x1, 0, W - 1))

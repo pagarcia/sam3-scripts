@@ -1,4 +1,4 @@
-# scripts/sam3_image_demo.py
+# scripts/sam3_video_demo.py
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -140,7 +140,7 @@ def _boxes_xyxy_px_to_xywh_norm(box_xyxy: Tuple[int, int, int, int], w: int, h: 
     y1, y2 = sorted((y1, y2))
     bw = max(1.0, x2 - x1)
     bh = max(1.0, y2 - y1)
-    # SAM3 video expects [xmin, ymin, width, height] normalized 0..1 :contentReference[oaicite:5]{index=5}
+    # SAM3 video expects [xmin, ymin, width, height] normalized 0..1
     return [[x1 / w, y1 / h, bw / w, bh / h]]
 
 
@@ -210,7 +210,7 @@ def _write_overlay_video(video_path: str, outputs: Dict[int, dict], out_path: st
                         union = masks[int(hit[0])].astype(bool)
                         frame = _overlay_union_mask(frame, union, alpha=0.5)
 
-            # draw boxes as (xmin,ymin,w,h) normalized -> pixels :contentReference[oaicite:6]{index=6}
+            # draw boxes as (xmin,ymin,w,h) normalized -> pixels
             if boxes.ndim == 2 and boxes.shape[1] == 4:
                 for i in range(min(len(boxes), 50)):
                     x, y, bw, bh = boxes[i].tolist()
@@ -264,9 +264,9 @@ def main() -> int:
 
     H, W = first.shape[:2]
 
-    # Build predictor (upstream API) :contentReference[oaicite:7]{index=7}
+    # Build predictor (upstream API)
     ckpt = args.checkpoint.strip() or None
-    predictor = build_sam3_video_predictor(checkpoint_path=ckpt, load_from_HF=(ckpt is None))
+    predictor = build_sam3_video_predictor(checkpoint_path=ckpt) if ckpt else build_sam3_video_predictor()
 
     # Start session
     resp = predictor.handle_request(dict(type="start_session", resource_path=args.video))
@@ -315,7 +315,7 @@ def main() -> int:
             type="add_prompt",
             session_id=session_id,
             frame_index=int(args.frame),
-            points=pts_rel,                 # rel coords by default :contentReference[oaicite:8]{index=8}
+            points=pts_rel,                 # rel coords by default
             point_labels=labs,
             obj_id=int(args.obj_id),
         ))
