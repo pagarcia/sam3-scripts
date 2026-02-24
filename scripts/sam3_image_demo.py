@@ -6,11 +6,10 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import numpy as np
 import cv2
-from PIL import Image
 import torch
 
 
@@ -23,7 +22,7 @@ def _ensure_sam3_on_path() -> None:
         for cand in [
             repo_root.parent / "sam3",          # ../sam3
             repo_root.parent / "sam3_repo",     # optional alt name
-            repo_root / "third_party" / "sam3"  # optional submodule style
+            repo_root / "third_party" / "sam3", # optional submodule style
         ]:
             if (cand / "sam3").exists():
                 sys.path.insert(0, str(cand))
@@ -31,177 +30,216 @@ def _ensure_sam3_on_path() -> None:
         raise
 
 
-def _overlay_union_mask(bgr: np.ndarray, mask_hw: np.ndarray, alpha: float = 0.5) -> np.ndarray:
-    """Green overlay of a boolean mask."""
-    mask = mask_hw.astype(bool)
+def pick_image_file() -> Optional[str]:
+    """Native file picker (Tkinter). Returns path or None."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return None
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    path = filedialog.askopenfilename(
+        title="Select an image",
+        filetypes=[
+            ("Images", "*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff"),
+            ("All files", "*.*"),
+        ],
+    )
+    root.destroy()
+    return path or None
+
+
+def compute_display_base(img_bgr: np.ndarray, max_side: int = 1200) -> Tuple[np.ndarray, float]:
+    h, w = img_bgr.shape[:2]
+    scale = min(1.0, float(max_side) / float(max(h, w)))
+    disp = cv2.resize(img_bgr, (int(w * scale), int(h * scale))) if scale < 1.0 else img_bgr.copy()
+    return disp, scale
+
+
+def green_overlay(bgr: np.ndarray, mask_bool: np.ndarray, alpha: float = 0.5) -> np.ndarray:
+    fg = mask_bool.astype(bool)
     color = np.zeros_like(bgr)
-    color[mask] = (0, 255, 0)
+    color[fg] = (0, 255, 0)
     return cv2.addWeighted(bgr, 1.0, color, alpha, 0.0)
 
 
-def _interactive_box_select(bgr: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
-    """Return (x1,y1,x2,y2) in pixels or None."""
-    disp = bgr.copy()
-    rect_s = rect_e = None
-    drawing = False
-
-    def redraw():
-        vis = disp.copy()
-        if rect_s and rect_e:
-            cv2.rectangle(vis, rect_s, rect_e, (0, 255, 255), 2)
-        cv2.imshow("Select box (ENTER=accept, ESC=cancel)", vis)
-
-    def cb(event, x, y, flags, param):
-        nonlocal rect_s, rect_e, drawing
-        if event == cv2.EVENT_LBUTTONDOWN:
-            drawing = True
-            rect_s = rect_e = (x, y)
-            redraw()
-        elif event == cv2.EVENT_MOUSEMOVE and drawing:
-            rect_e = (x, y)
-            redraw()
-        elif event == cv2.EVENT_LBUTTONUP and drawing:
-            drawing = False
-            rect_e = (x, y)
-            redraw()
-        elif event == cv2.EVENT_RBUTTONDOWN:
-            rect_s = rect_e = None
-            redraw()
-
-    cv2.namedWindow("Select box (ENTER=accept, ESC=cancel)", cv2.WINDOW_AUTOSIZE)
-    cv2.setMouseCallback("Select box (ENTER=accept, ESC=cancel)", cb)
-    redraw()
-
-    while True:
-        k = cv2.waitKey(20) & 0xFF
-        if k == 27:  # ESC
-            cv2.destroyAllWindows()
-            return None
-        if k in (13, 10):  # ENTER
-            cv2.destroyAllWindows()
-            break
-
-    if not (rect_s and rect_e):
-        return None
-
-    x1, y1 = rect_s
-    x2, y2 = rect_e
-    x1, x2 = sorted((x1, x2))
-    y1, y2 = sorted((y1, y2))
-    return (x1, y1, x2, y2)
-
-
 def main() -> int:
-    ap = argparse.ArgumentParser("SAM3 image demo (text and/or box prompt)")
-    ap.add_argument("--image", required=True, help="Path to an image file.")
-    ap.add_argument("--text", default=None, help="Text prompt, e.g. 'person'.")
-    ap.add_argument("--box", nargs=4, type=int, default=None,
-                    metavar=("X1", "Y1", "X2", "Y2"),
-                    help="Box prompt in pixel coords (xyxy).")
-    ap.add_argument("--interactive-box", action="store_true", help="Draw a box in an OpenCV window.")
+    ap = argparse.ArgumentParser("SAM3 interactive image demo (points)")
+    ap.add_argument("--image", default=None, help="Optional image path. If omitted, a file dialog opens.")
     ap.add_argument("--checkpoint", default=os.getenv("SAM3_CHECKPOINT", ""),
                     help="Optional local sam3.pt path (avoids HF download).")
     ap.add_argument("--device", default=("cuda" if torch.cuda.is_available() else "cpu"))
-    ap.add_argument("--conf", type=float, default=0.5, help="Confidence threshold for masks.")
-    ap.add_argument("--out", default="sam3_out.png")
-    ap.add_argument("--show", action="store_true")
+    ap.add_argument("--max-side", type=int, default=1200, help="Max display size for interactive window.")
     args = ap.parse_args()
 
-    if not args.text and not args.box and not args.interactive_box:
-        ap.error("Provide --text and/or --box/--interactive-box.")
+    if args.device != "cuda":
+        raise SystemExit(
+            "This interactive point demo uses SAM3's instance-interactivity predictor, "
+            "which is CUDA-oriented in the upstream stack. Use --device cuda."
+        )
+
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is not available. This interactive predictor path expects CUDA.")
 
     _ensure_sam3_on_path()
-    from sam3.model_builder import build_sam3_image_model
-    from sam3.model.sam3_image_processor import Sam3Processor
+    from sam3.model_builder import build_sam3_image_model  # upstream builder
 
-    # Load image
-    img_pil = Image.open(args.image).convert("RGB")
-    bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-    H, W = bgr.shape[:2]
+    # Pick image
+    img_path = args.image or pick_image_file()
+    if not img_path:
+        raise SystemExit("No image selected.")
 
-    # Optional interactive box
-    box_xyxy = tuple(args.box) if args.box else None
-    if args.interactive_box:
-        sel = _interactive_box_select(bgr)
-        if sel is not None:
-            box_xyxy = sel
+    img_bgr = cv2.imread(img_path, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise SystemExit(f"Could not read image: {img_path}")
+
+    H, W = img_bgr.shape[:2]
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
     ckpt = args.checkpoint.strip() or None
 
-    # Build model + processor (SAM3 upstream API)
+    # Build SAM3 with instance interactivity enabled (gives model.inst_interactive_predictor)
     model = build_sam3_image_model(
         checkpoint_path=ckpt,
         load_from_HF=(ckpt is None),
-        device=args.device,
+        device="cuda",
         eval_mode=True,
+        enable_inst_interactivity=True,
+        enable_segmentation=False,  # not needed for point-based interactive masks
     )
-    processor = Sam3Processor(model, device=args.device, confidence_threshold=args.conf)
 
-    state = processor.set_image(img_pil)
+    predictor = getattr(model, "inst_interactive_predictor", None)
+    if predictor is None:
+        raise SystemExit("Model was built without inst_interactive_predictor. (enable_inst_interactivity=True required)")
 
-    # Text prompt
-    if args.text:
-        state = processor.set_text_prompt(prompt=args.text, state=state)
+    # Set image embeddings once
+    predictor.set_image(img_rgb)
 
-    # Box prompt (Sam3Processor expects normalized [cx,cy,w,h])
-    if box_xyxy is not None:
-        x1, y1, x2, y2 = box_xyxy
-        x1 = int(np.clip(x1, 0, W - 1))
-        x2 = int(np.clip(x2, 0, W - 1))
-        y1 = int(np.clip(y1, 0, H - 1))
-        y2 = int(np.clip(y2, 0, H - 1))
-        x1, x2 = sorted((x1, x2))
-        y1, y2 = sorted((y1, y2))
+    disp_base, scale = compute_display_base(img_bgr, max_side=args.max_side)
 
-        cx = ((x1 + x2) * 0.5) / float(W)
-        cy = ((y1 + y2) * 0.5) / float(H)
-        bw = (x2 - x1) / float(W)
-        bh = (y2 - y1) / float(H)
+    points: List[Tuple[int, int]] = []
+    labels: List[int] = []
+    last_mask_disp: Optional[np.ndarray] = None
 
-        state = processor.add_geometric_prompt(
-            box=[cx, cy, bw, bh],
-            label=True,
-            state=state,
+    def redraw():
+        vis = disp_base.copy()
+
+        if last_mask_disp is not None:
+            vis = green_overlay(vis, last_mask_disp, alpha=0.5)
+
+        # draw points
+        for (px, py), lab in zip(points, labels):
+            x = int(px * scale)
+            y = int(py * scale)
+            col = (0, 0, 255) if lab == 1 else (255, 0, 0)  # red=pos, blue=neg
+            cv2.circle(vis, (x, y), 6, col, -1)
+
+        cv2.imshow("SAM3 Interactive (L=pos, R=neg, M/reset, u=undo, r=reset, ESC=quit)", vis)
+
+    def run_predict():
+        nonlocal last_mask_disp
+        if not points:
+            last_mask_disp = None
+            redraw()
+            return
+
+        pc = np.asarray(points, dtype=np.float32)  # pixel coords
+        pl = np.asarray(labels, dtype=np.int32)
+
+        masks, scores, _lowres = predictor.predict(
+            point_coords=pc,
+            point_labels=pl,
+            box=None,
+            mask_input=None,
+            multimask_output=True,
+            return_logits=False,
+            normalize_coords=True,  # True means input coords are absolute pixels; SAM2Transforms will normalize.
         )
 
-    masks = state.get("masks", None)
-    boxes = state.get("boxes", None)
-    scores = state.get("scores", None)
+        # masks: [C,H,W] boolean (return_logits=False); scores: [C]
+        if masks is None or len(masks) == 0:
+            last_mask_disp = None
+            redraw()
+            return
 
-    if masks is None or (hasattr(masks, "numel") and masks.numel() == 0):
-        print("[WARN] No masks returned.")
-        out_bgr = bgr
-    else:
-        if isinstance(masks, torch.Tensor):
-            masks_np = masks.detach().cpu().numpy()
+        best = int(np.argmax(scores)) if scores is not None and len(scores) else 0
+        mask_hw = masks[best].astype(bool)
+
+        # resize mask to display
+        if scale != 1.0:
+            mask_disp = cv2.resize(mask_hw.astype(np.uint8), (disp_base.shape[1], disp_base.shape[0]),
+                                   interpolation=cv2.INTER_NEAREST).astype(bool)
         else:
-            masks_np = np.asarray(masks)
+            mask_disp = mask_hw
 
-        # masks_np is typically [K,1,H,W] or [K,H,W]
-        while masks_np.ndim > 3:
-            masks_np = masks_np[:, 0]
-        union = np.any(masks_np.astype(bool), axis=0)
-        out_bgr = _overlay_union_mask(bgr, union, alpha=0.5)
+        last_mask_disp = mask_disp
+        redraw()
 
-        # Optional: draw boxes
-        if boxes is not None:
-            bx = boxes.detach().cpu().numpy() if isinstance(boxes, torch.Tensor) else np.asarray(boxes)
-            sc = scores.detach().cpu().numpy() if isinstance(scores, torch.Tensor) else (np.asarray(scores) if scores is not None else None)
-            for i in range(min(len(bx), 50)):
-                x1, y1, x2, y2 = bx[i].astype(int).tolist()
-                cv2.rectangle(out_bgr, (x1, y1), (x2, y2), (0, 255, 255), 2)
-                if sc is not None:
-                    cv2.putText(out_bgr, f"{sc[i]:.2f}", (x1, max(0, y1 - 6)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    def reset_all():
+        nonlocal last_mask_disp
+        points.clear()
+        labels.clear()
+        last_mask_disp = None
+        redraw()
 
-    cv2.imwrite(args.out, out_bgr)
-    print(f"[OK] Wrote {args.out}")
+    def undo_last():
+        if points:
+            points.pop()
+            labels.pop()
+        run_predict()
 
-    if args.show:
-        cv2.imshow("SAM3 image result", out_bgr)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
+    def mouse_cb(event, x, y, flags, param):
+        # map display -> original pixel coords
+        px = int(x / scale)
+        py = int(y / scale)
+        px = max(0, min(W - 1, px))
+        py = max(0, min(H - 1, py))
 
+        if event == cv2.EVENT_MBUTTONDOWN:
+            reset_all()
+            return
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            points.append((px, py))
+            labels.append(1)
+            run_predict()
+            return
+
+        if event == cv2.EVENT_RBUTTONDOWN:
+            points.append((px, py))
+            labels.append(0)
+            run_predict()
+            return
+
+    cv2.namedWindow("SAM3 Interactive (L=pos, R=neg, M/reset, u=undo, r=reset, ESC=quit)", cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback("SAM3 Interactive (L=pos, R=neg, M/reset, u=undo, r=reset, ESC=quit)", mouse_cb)
+
+    print("[INFO] Controls:")
+    print("  L-click = positive point")
+    print("  R-click = negative point")
+    print("  M-click = reset")
+    print("  u      = undo last point")
+    print("  r      = reset")
+    print("  ESC/q  = quit")
+
+    redraw()
+    while True:
+        k = cv2.waitKey(20) & 0xFF
+        if k in (27, ord("q")):  # ESC or q
+            break
+        if k == ord("r"):
+            reset_all()
+        if k == ord("u"):
+            undo_last()
+
+    cv2.destroyAllWindows()
     return 0
 
 
