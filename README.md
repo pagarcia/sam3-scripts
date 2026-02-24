@@ -106,11 +106,29 @@ pip install torch torchvision
 pip install -r requirements_mac.txt
 ```
 
-### 5) Hugging Face auth (gated weights)
+### 5) Hugging Face access + login (gated weights)
 
+SAM3 model weights on Hugging Face are **gated**.
+
+1) **Request access** (one-time, per Hugging Face account):
+   - Go to the model page on Hugging Face (e.g. `facebook/sam3`)
+   - Click **Request access** and accept the terms (approval can take time).
+
+2) **Log in locally** (per machine / per environment):
 ```bash
 hf auth login
-```
+````
+
+This stores a token under your user profile (so future runs won’t prompt again) and allows `transformers` / `huggingface_hub` to download the weights.
+
+3. **Caching**
+   Once downloaded, weights are cached locally and won’t re-download unless you clear the cache.
+   Default cache location is typically:
+
+* macOS/Linux: `~/.cache/huggingface/`
+* Windows: `%USERPROFILE%\.cache\huggingface\`
+
+Tip: if you’re on a machine without internet access, download once on a connected machine and copy the cache folder.
 
 ### 6) Run demos
 
