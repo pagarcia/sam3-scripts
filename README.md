@@ -138,8 +138,10 @@ python scripts/sam3_image_demo_hf.py --model-id facebook/sam3
 
 ## Notes
 
-* **First run downloads weights** (can be several GB). Downloads are cached under `~/.cache/huggingface/`.
-* macOS uses **Transformers** because upstream `facebookresearch/sam3` depends on Triton/CUDA and is not mac-friendly.
-* Windows backend is fastest when you have an NVIDIA GPU.
+* **First run downloads weights** (can be several GB). Downloads are cached under `~/.cache/huggingface/` (macOS/Linux) or the Hugging Face cache directory on Windows (same default path under your user profile).
+* **macOS uses the Transformers backend** because the upstream `facebookresearch/sam3` repo is CUDA/Triton-oriented and is not mac-friendly in practice.
+* **Windows has two working options**:
+  * **Upstream backend (`sam3_image_demo.py`, `sam3_video_demo.py`)**: fastest on NVIDIA GPUs and closest to Meta’s reference implementation, but requires more platform-specific deps (e.g., Triton on Windows).
+  * **Transformers backend (`*_hf.py`)**: also works on Windows (CUDA or CPU) and is usually simpler to install, but the codepath is a reimplementation and may differ slightly in behavior/performance compared to upstream.
 
 ```
